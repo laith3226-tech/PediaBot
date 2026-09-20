@@ -1,12 +1,12 @@
-name: PediaBot Daily Channel
+name: PediaBot Production
 
 on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "What to publish"
+        description: "Publish mode"
         required: true
-        default: "brief"
+        default: brief
         type: choice
         options:
           - brief
@@ -17,14 +17,21 @@ on:
     - cron: "0 19 * * *" # 22:00 Qatar
 
 permissions:
-  contents: read
+  contents: write
+
+concurrency:
+  group: pediabot-production
+  cancel-in-progress: false
 
 jobs:
   publish:
     runs-on: ubuntu-latest
+    timeout-minutes: 12
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:
@@ -33,21 +40,36 @@ jobs:
 
       - run: pip install -r requirements.txt
 
-      - name: Choose mode
+      - run: python pediabot.py selfcheck
+
+      - name: Select mode
         id: mode
         shell: bash
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "value=${{ inputs.mode }}" >> "$GITHUB_OUTPUT"
-          elif [ "$(date -u +%H)" = "19" ]; then
+          elif [ "${{ github.event.schedule }}" = "0 19 * * *" ]; then
             echo "value=reveal" >> "$GITHUB_OUTPUT"
           else
             echo "value=brief" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Publish to Telegram
+      - name: Publish
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TELEGRAM_CHAT_ID: "@LaythPeds"
           MODE: ${{ steps.mode.outputs.value }}
         run: python pediabot.py
+
+      - name: Persist daily state
+        if: steps.mode.outputs.value == 'brief'
+        shell: bash
+        run: |
+          if git diff --quiet -- data/state.json; then exit 0; fi
+          git config user.name "PediaBot"
+          git config user.email "actions@users.noreply.github.com"
+          git add data/state.json
+          git commit -m "PediaBot: persist daily questions/evidence"
+          git push
+      
