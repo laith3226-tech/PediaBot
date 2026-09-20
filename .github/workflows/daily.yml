@@ -1,75 +1,1184 @@
-name: PediaBot Production
+import os
+import sys
+import json
+import html
+import re
+import time
+import hashlib
+from pathlib import Path
+from datetime import datetime, timezone, timedelta
+from difflib import SequenceMatcher
+import xml.etree.ElementTree as ET
 
-on:
-  workflow_dispatch:
-    inputs:
-      mode:
-        description: "Publish mode"
-        required: true
-        default: brief
-        type: choice
-        options:
-          - brief
-          - reveal
+import requests
 
-  schedule:
-    - cron: "0 17 * * *" # 20:00 Qatar
-    - cron: "0 19 * * *" # 22:00 Qatar
 
-permissions:
-  contents: write
+BASE = Path(__file__).resolve().parent
+STATE_FILE = BASE / "data/state.json"
 
-concurrency:
-  group: pediabot-production
-  cancel-in-progress: false
+TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+GEMINI_KEY = os.getenv("GEMINI_API_KEY", "")
+CHAT = os.getenv("TELEGRAM_CHAT_ID", "@LaythPeds")
 
-jobs:
-  publish:
-    runs-on: ubuntu-latest
-    timeout-minutes: 12
+# Gemini model
+MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
 
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+TG = f"https://api.telegram.org/bot{TG_TOKEN}" if TG_TOKEN else ""
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-          cache: pip
+UA = {
+    "User-Agent": "DrLaythPediatricsBot/2.0"
+}
 
-      - run: pip install -r requirements.txt
+DOMAINS = [
+    "General Pediatrics",
+    "Neonatology",
+    "Emergency",
+    "PICU",
+    "Pulmonology",
+    "Cardiology",
+    "Infectious Disease",
+    "Gastroenterology",
+    "Neurology",
+    "Nephrology",
+    "Endocrinology",
+    "Hematology/Oncology",
+    "Rheumatology",
+    "Genetics/Metabolic",
+    "Development",
+    "Adolescent Medicine",
+]
 
-      - run: python pediabot.py selfcheck
+MAX_MSG = 3900
 
-      - name: Select mode
-        id: mode
-        shell: bash
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "value=${{ inputs.mode }}" >> "$GITHUB_OUTPUT"
-          elif [ "${{ github.event.schedule }}" = "0 19 * * *" ]; then
-            echo "value=reveal" >> "$GITHUB_OUTPUT"
-          else
-            echo "value=brief" >> "$GITHUB_OUTPUT"
-          fi
+PUBMED_TERM = (
+    "(infant[Title/Abstract] "
+    "OR child[Title/Abstract] "
+    "OR pediatric*[Title/Abstract] "
+    "OR adolescent*[Title/Abstract]) "
+    "AND ("
+    "guideline[Publication Type] "
+    "OR practice guideline[Publication Type] "
+    "OR meta-analysis[Publication Type] "
+    "OR systematic review[Publication Type] "
+    "OR randomized controlled trial[Publication Type] "
+    "OR clinical trial[Publication Type]"
+    ")"
+)
 
-      - name: Publish
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          TELEGRAM_CHAT_ID: "@LaythPeds"
-          MODE: ${{ steps.mode.outputs.value }}
-        run: python pediabot.py
 
-      - name: Persist daily state
-        if: steps.mode.outputs.value == 'brief'
-        shell: bash
-        run: |
-          if git diff --quiet -- data/state.json; then exit 0; fi
-          git config user.name "PediaBot"
-          git config user.email "actions@users.noreply.github.com"
-          git add data/state.json
-          git commit -m "PediaBot: persist daily questions/evidence"
-          git push
-      
+# =========================================================
+# TIME / STATE
+# =========================================================
+
+def qatar_now():
+    return datetime.now(timezone.utc) + timedelta(hours=3)
+
+
+def daykey():
+    return qatar_now().strftime("%Y-%m-%d")
+
+
+def load_state():
+    try:
+        return json.loads(
+            STATE_FILE.read_text(encoding="utf-8")
+        )
+    except Exception:
+        return {
+            "days": {},
+            "question_history": [],
+            "article_history": [],
+        }
+
+
+def save_state(state):
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+    STATE_FILE.write_text(
+        json.dumps(
+            state,
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+
+# =========================================================
+# HTTP
+# =========================================================
+
+def request(method, url, **kwargs):
+
+    last_error = None
+
+    for attempt in range(3):
+
+        try:
+
+            response = requests.request(
+                method,
+                url,
+                headers=UA,
+                timeout=(10, 40),
+                **kwargs,
+            )
+
+            response.raise_for_status()
+
+            return response
+
+        except requests.RequestException as exc:
+
+            last_error = exc
+
+            if attempt < 2:
+                time.sleep(2 ** attempt)
+
+    raise last_error
+
+
+# =========================================================
+# TELEGRAM
+# =========================================================
+
+def telegram(method, payload):
+
+    if not TG_TOKEN:
+        raise RuntimeError(
+            "TELEGRAM_BOT_TOKEN missing"
+        )
+
+    response = request(
+        "POST",
+        f"{TG}/{method}",
+        json=payload,
+    ).json()
+
+    if not response.get("ok"):
+
+        raise RuntimeError(
+            f"Telegram error: {response}"
+        )
+
+    return response
+
+
+def send_html(text):
+
+    while text:
+
+        if len(text) <= MAX_MSG:
+
+            part = text
+            text = ""
+
+        else:
+
+            cut = text.rfind(
+                "\n\n",
+                0,
+                MAX_MSG,
+            )
+
+            if cut < 800:
+                cut = MAX_MSG
+
+            part = text[:cut]
+
+            text = text[cut:].lstrip()
+
+        telegram(
+            "sendMessage",
+            {
+                "chat_id": CHAT,
+                "text": part,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            },
+        )
+
+
+# =========================================================
+# PUBMED
+# =========================================================
+
+def pubmed_candidates(number=12):
+
+    search = request(
+        "GET",
+        "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi",
+        params={
+            "db": "pubmed",
+            "term": PUBMED_TERM,
+            "retmode": "json",
+            "retmax": str(number),
+            "sort": "pub date",
+            "datetype": "pdat",
+            "reldate": "21",
+        },
+    ).json()
+
+    ids = (
+        search
+        .get("esearchresult", {})
+        .get("idlist", [])
+    )
+
+    if not ids:
+        return []
+
+    xml_text = request(
+        "GET",
+        "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi",
+        params={
+            "db": "pubmed",
+            "id": ",".join(ids),
+            "retmode": "xml",
+        },
+    ).text
+
+    root = ET.fromstring(xml_text)
+
+    articles = []
+
+    for article in root.findall(".//PubmedArticle"):
+
+        pmid = (
+            article.findtext(".//PMID")
+            or ""
+        ).strip()
+
+        title_element = article.find(
+            ".//ArticleTitle"
+        )
+
+        if title_element is not None:
+
+            title = "".join(
+                title_element.itertext()
+            )
+
+        else:
+            title = ""
+
+        title = re.sub(
+            r"\s+",
+            " ",
+            title,
+        ).strip()
+
+        journal = (
+            article.findtext(
+                ".//Journal/Title"
+            )
+            or article.findtext(
+                ".//Journal/ISOAbbreviation"
+            )
+            or "PubMed"
+        ).strip()
+
+        pubdate = article.find(
+            ".//PubDate"
+        )
+
+        date = "Recent"
+
+        if pubdate is not None:
+
+            medline_date = pubdate.findtext(
+                "MedlineDate"
+            )
+
+            year = pubdate.findtext(
+                "Year"
+            )
+
+            if medline_date:
+                date = medline_date.strip()
+
+            elif year:
+                date = year.strip()
+
+        abstract_parts = []
+
+        for element in article.findall(
+            ".//Abstract/AbstractText"
+        ):
+
+            text = "".join(
+                element.itertext()
+            )
+
+            text = re.sub(
+                r"\s+",
+                " ",
+                text,
+            ).strip()
+
+            if text:
+                abstract_parts.append(text)
+
+        abstract = " ".join(
+            abstract_parts
+        )
+
+        if title and abstract:
+
+            articles.append(
+                {
+                    "pmid": pmid,
+                    "title": title,
+                    "journal": journal,
+                    "date": date,
+                    "abstract": abstract[:6000],
+                    "url": (
+                        "https://pubmed.ncbi.nlm.nih.gov/"
+                        f"{pmid}/"
+                    ),
+                }
+            )
+
+    return articles
+
+
+# =========================================================
+# GEMINI
+# =========================================================
+
+def gemini_json(prompt):
+
+    if not GEMINI_KEY:
+
+        raise RuntimeError(
+            "GEMINI_API_KEY missing"
+        )
+
+    url = (
+        "https://generativelanguage.googleapis.com/"
+        f"v1beta/models/{MODEL}:generateContent"
+        f"?key={GEMINI_KEY}"
+    )
+
+    body = {
+        "contents": [
+            {
+                "parts": [
+                    {
+                        "text": prompt
+                    }
+                ]
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0.35,
+            "responseMimeType": "application/json",
+        },
+    }
+
+    response = request(
+        "POST",
+        url,
+        json=body,
+    ).json()
+
+    candidates = response.get(
+        "candidates",
+        []
+    )
+
+    if not candidates:
+
+        raise RuntimeError(
+            f"Gemini returned no candidates: {response}"
+        )
+
+    text = (
+        candidates[0]
+        ["content"]
+        ["parts"][0]
+        ["text"]
+    )
+
+    return json.loads(text)
+
+
+# =========================================================
+# DUPLICATE DETECTION
+# =========================================================
+
+def similarity(a, b):
+
+    a = re.sub(
+        r"\W+",
+        " ",
+        a.lower(),
+    )
+
+    b = re.sub(
+        r"\W+",
+        " ",
+        b.lower(),
+    )
+
+    words_a = set(a.split())
+    words_b = set(b.split())
+
+    jaccard = (
+        len(words_a & words_b)
+        /
+        max(
+            1,
+            len(words_a | words_b),
+        )
+    )
+
+    sequence = SequenceMatcher(
+        None,
+        a,
+        b,
+    ).ratio()
+
+    return max(
+        jaccard,
+        sequence,
+    )
+
+
+# =========================================================
+# DOMAIN ROTATION
+# =========================================================
+
+def choose_domains(state):
+
+    successful_days = len(
+        state.get(
+            "days",
+            {},
+        )
+    )
+
+    index = successful_days * 2
+
+    return [
+        DOMAINS[
+            index
+            % len(DOMAINS)
+        ],
+        DOMAINS[
+            (index + 1)
+            % len(DOMAINS)
+        ],
+    ]
+
+
+# =========================================================
+# QUESTION GENERATION
+# =========================================================
+
+def generate_questions(
+    state,
+    domains,
+    evidence,
+):
+
+    history = state.get(
+        "question_history",
+        [],
+    )
+
+    recent_questions = [
+        item["question"]
+        for item in history[-200:]
+    ]
+
+    evidence_text = "\n\n".join(
+        (
+            f"{item['title']}\n"
+            f"{item['abstract'][:1800]}\n"
+            f"{item['url']}"
+        )
+        for item in evidence[:4]
+    )
+
+    avoid_text = "\n".join(
+        "- " + question
+        for question
+        in recent_questions[-80:]
+    )
+
+    prompt = f"""
+You are a pediatric chief resident creating
+TWO original Arab Board/QBMS-level pediatric MCQs.
+
+Domains in exact order:
+
+1. {domains[0]}
+2. {domains[1]}
+
+Create exactly ONE question from each domain.
+
+Requirements:
+
+- Case-based
+- Pediatric resident level
+- Clinically realistic
+- High-yield
+- Concise
+- No simple trivia
+- Exactly four plausible options
+- Exactly one best answer
+- Current standard pediatric practice
+- Do NOT invent guidelines
+- Do NOT invent trials
+- Do NOT invent doses
+- Do NOT invent statistics
+- Avoid institution-specific answers
+- Do not repeat or closely paraphrase
+  previously published questions
+
+Recent pediatric evidence is provided below.
+It is OPTIONAL context.
+Do not force it into the MCQs.
+
+EVIDENCE:
+
+{evidence_text}
+
+PREVIOUS QUESTIONS TO AVOID:
+
+{avoid_text}
+
+Return ONLY valid JSON.
+
+Schema:
+
+{{
+  "questions": [
+    {{
+      "domain": "{domains[0]}",
+      "question": "case stem <=300 characters",
+      "options": [
+        "option A",
+        "option B",
+        "option C",
+        "option D"
+      ],
+      "answer": 0,
+      "explanation":
+        "2-4 sentence explanation",
+      "distractors": [
+        "reason A is wrong, or empty if correct",
+        "reason B is wrong, or empty if correct",
+        "reason C is wrong, or empty if correct",
+        "reason D is wrong, or empty if correct"
+      ],
+      "pearl":
+        "one high-yield clinical pearl",
+      "reference":
+        "authoritative guideline, society, textbook, or PubMed source"
+    }},
+    {{
+      "domain": "{domains[1]}",
+      "question": "case stem <=300 characters",
+      "options": [
+        "option A",
+        "option B",
+        "option C",
+        "option D"
+      ],
+      "answer": 0,
+      "explanation":
+        "2-4 sentence explanation",
+      "distractors": [
+        "reason A is wrong, or empty if correct",
+        "reason B is wrong, or empty if correct",
+        "reason C is wrong, or empty if correct",
+        "reason D is wrong, or empty if correct"
+      ],
+      "pearl":
+        "one high-yield clinical pearl",
+      "reference":
+        "authoritative guideline, society, textbook, or PubMed source"
+    }}
+  ]
+}}
+"""
+
+    for attempt in range(4):
+
+        result = gemini_json(
+            prompt
+        )
+
+        questions = result.get(
+            "questions",
+            [],
+        )
+
+        if len(questions) != 2:
+            continue
+
+        valid = True
+
+        for index, question in enumerate(
+            questions
+        ):
+
+            if (
+                question.get("domain")
+                != domains[index]
+            ):
+                valid = False
+                break
+
+            if len(
+                question.get(
+                    "options",
+                    [],
+                )
+            ) != 4:
+                valid = False
+                break
+
+            answer = int(
+                question.get(
+                    "answer",
+                    -1,
+                )
+            )
+
+            if not 0 <= answer < 4:
+                valid = False
+                break
+
+            if len(
+                question.get(
+                    "distractors",
+                    [],
+                )
+            ) != 4:
+                valid = False
+                break
+
+            if len(
+                question.get(
+                    "question",
+                    "",
+                )
+            ) > 300:
+                valid = False
+                break
+
+            for old_question in recent_questions:
+
+                if (
+                    similarity(
+                        question["question"],
+                        old_question,
+                    )
+                    >= 0.72
+                ):
+
+                    valid = False
+                    break
+
+            if not valid:
+                break
+
+        if valid:
+            return questions
+
+        prompt += """
+The previous attempt failed validation
+or was too similar to an older question.
+Generate substantially different cases.
+"""
+
+    raise RuntimeError(
+        "Could not generate two unique "
+        "validated questions after retries"
+    )
+
+
+# =========================================================
+# EVIDENCE SUMMARIZATION
+# =========================================================
+
+def summarize_evidence(
+    state,
+    candidates,
+):
+
+    used_pmids = set(
+        state.get(
+            "article_history",
+            [],
+        )
+    )
+
+    fresh = [
+        item
+        for item in candidates
+        if item["pmid"]
+        not in used_pmids
+    ][:4]
+
+    if not fresh:
+        return []
+
+    records = "\n\n".join(
+        (
+            f"PMID {item['pmid']}\n"
+            f"TITLE: {item['title']}\n"
+            f"JOURNAL: {item['journal']}\n"
+            f"DATE: {item['date']}\n"
+            f"ABSTRACT: {item['abstract']}"
+        )
+        for item in fresh
+    )
+
+    prompt = f"""
+Summarize the following pediatric PubMed
+records for a pediatric resident Telegram brief.
+
+STRICT RULES:
+
+- Use ONLY information explicitly present
+  in the supplied title and abstract.
+- Do not invent numbers.
+- Do not invent outcomes.
+- Do not invent recommendations.
+- Do not invent causality.
+- Keep the summary clinically useful.
+- If practice-changing significance cannot
+  be established, do not claim it.
+
+Return ONLY JSON:
+
+{{
+  "items": [
+    {{
+      "pmid": "...",
+      "summary":
+        "Two concise sentences.",
+      "why":
+        "One clinically useful sentence."
+    }}
+  ]
+}}
+
+RECORDS:
+
+{records}
+"""
+
+    try:
+
+        generated = gemini_json(
+            prompt
+        )
+
+        generated_items = {
+            item["pmid"]: item
+            for item in generated.get(
+                "items",
+                [],
+            )
+        }
+
+    except Exception:
+
+        generated_items = {}
+
+    output = []
+
+    for article in fresh:
+
+        generated = generated_items.get(
+            article["pmid"]
+        )
+
+        if (
+            generated
+            and generated.get("summary")
+            and generated.get("why")
+        ):
+
+            combined = dict(article)
+
+            combined.update(
+                generated
+            )
+
+            output.append(
+                combined
+            )
+
+    return output
+
+
+# =========================================================
+# DAILY BRIEF
+# =========================================================
+
+def post_brief():
+
+    state = load_state()
+
+    today = daykey()
+
+    if today in state["days"]:
+
+        day = state["days"][today]
+
+        questions = day["questions"]
+
+        evidence_items = day.get(
+            "evidence",
+            [],
+        )
+
+    else:
+
+        candidates = pubmed_candidates(
+            12
+        )
+
+        evidence_items = (
+            summarize_evidence(
+                state,
+                candidates,
+            )
+        )
+
+        domains = choose_domains(
+            state
+        )
+
+        questions = generate_questions(
+            state,
+            domains,
+            candidates,
+        )
+
+        day = {
+            "questions": questions,
+            "evidence": evidence_items,
+            "created_at":
+                qatar_now().isoformat(),
+        }
+
+        state["days"][today] = day
+
+        for question in questions:
+
+            state[
+                "question_history"
+            ].append(
+                {
+                    "date": today,
+                    "domain":
+                        question["domain"],
+                    "question":
+                        question["question"],
+                    "hash":
+                        hashlib.sha256(
+                            question[
+                                "question"
+                            ].encode()
+                        ).hexdigest(),
+                }
+            )
+
+        state[
+            "article_history"
+        ] += [
+            item["pmid"]
+            for item
+            in evidence_items
+        ]
+
+        state[
+            "question_history"
+        ] = state[
+            "question_history"
+        ][-2000:]
+
+        state[
+            "article_history"
+        ] = state[
+            "article_history"
+        ][-2000:]
+
+        save_state(
+            state
+        )
+
+    lines = [
+        "🩺 <b>Dr. Layth Pediatrics — Daily Brief</b>",
+        "<i>Evidence + Board Review | تحديثات الأطفال</i>",
+        "",
+    ]
+
+    if evidence_items:
+
+        for index, item in enumerate(
+            evidence_items,
+            1,
+        ):
+
+            lines += [
+                (
+                    f"<b>{index}. "
+                    f"{html.escape(item['title'])}"
+                    "</b>"
+                ),
+                (
+                    f"📅 {html.escape(item['date'])}"
+                    f" | 🏛 "
+                    f"{html.escape(item['journal'])}"
+                ),
+                (
+                    "🧠 "
+                    + html.escape(
+                        item["summary"]
+                    )
+                ),
+                (
+                    "💎 <b>Why it matters:</b> "
+                    + html.escape(
+                        item["why"]
+                    )
+                ),
+                (
+                    f'🔗 <a href="'
+                    f'{html.escape(item["url"])}'
+                    '">PubMed / original indexed record</a>'
+                ),
+                "",
+            ]
+
+    else:
+
+        lines += [
+            (
+                "📚 No sufficiently supported "
+                "new evidence summary today; "
+                "filler was intentionally omitted."
+            ),
+            "",
+        ]
+
+    lines += [
+        "<b>Board Challenge</b>",
+        (
+            "Two new resident-level cases. "
+            "Vote now; answer reveal at "
+            "22:00 Qatar."
+        ),
+    ]
+
+    send_html(
+        "\n".join(lines)
+    )
+
+    for index, question in enumerate(
+        questions,
+        1,
+    ):
+
+        telegram(
+            "sendMessage",
+            {
+                "chat_id": CHAT,
+                "text": (
+                    f"<b>Q{index} • "
+                    f"{html.escape(question['domain'])}"
+                    "</b>"
+                ),
+                "parse_mode": "HTML",
+            },
+        )
+
+        telegram(
+            "sendPoll",
+            {
+                "chat_id": CHAT,
+                "question":
+                    question["question"],
+                "options": [
+                    {
+                        "text": (
+                            f"{chr(65 + i)}. "
+                            f"{option}"
+                        )
+                    }
+                    for i, option
+                    in enumerate(
+                        question["options"]
+                    )
+                ],
+                "is_anonymous": True,
+                "type": "regular",
+                "allows_multiple_answers": False,
+            },
+        )
+
+
+# =========================================================
+# ANSWER REVEAL
+# =========================================================
+
+def reveal():
+
+    state = load_state()
+
+    today = daykey()
+
+    if today not in state.get(
+        "days",
+        {},
+    ):
+
+        raise RuntimeError(
+            "No persisted questions for today. "
+            "Run brief first."
+        )
+
+    questions = state[
+        "days"
+    ][today]["questions"]
+
+    lines = [
+        "✅ <b>Daily Board Challenge — Answer Reveal</b>",
+        "",
+    ]
+
+    for index, question in enumerate(
+        questions,
+        1,
+    ):
+
+        answer = int(
+            question["answer"]
+        )
+
+        lines += [
+            (
+                f"<b>Q{index} • "
+                f"{html.escape(question['domain'])}"
+                "</b>"
+            ),
+            (
+                f"🎯 <b>"
+                f"{chr(65 + answer)}. "
+                f"{html.escape(question['options'][answer])}"
+                "</b>"
+            ),
+            (
+                "🧠 "
+                + html.escape(
+                    question["explanation"]
+                )
+            ),
+            (
+                "❌ <b>Why the others are wrong:</b>"
+            ),
+        ]
+
+        for option_index in range(4):
+
+            if option_index == answer:
+                continue
+
+            lines.append(
+                (
+                    f"• <b>"
+                    f"{chr(65 + option_index)}."
+                    f"</b> "
+                    f"{html.escape(question['distractors'][option_index])}"
+                )
+            )
+
+        lines += [
+            (
+                "💎 <b>Clinical pearl:</b> "
+                + html.escape(
+                    question["pearl"]
+                )
+            ),
+            (
+                "📚 <b>Reference:</b> "
+                + html.escape(
+                    question["reference"]
+                )
+            ),
+            "",
+        ]
+
+    send_html(
+        "\n".join(lines)
+    )
+
+
+# =========================================================
+# SELF CHECK
+# =========================================================
+
+def selfcheck():
+
+    assert len(DOMAINS) == 16
+
+    assert len(
+        set(DOMAINS)
+    ) == 16
+
+    sample_state = {
+        "days": {},
+        "question_history": [],
+        "article_history": [],
+    }
+
+    assert (
+        choose_domains(
+            sample_state
+        )
+        == DOMAINS[:2]
+    )
+
+    assert MAX_MSG < 4096
+
+    print(
+        "SELF-CHECK OK"
+    )
+
+
+# =========================================================
+# ENTRY POINT
+# =========================================================
+
+if __name__ == "__main__":
+
+    mode = (
+        sys.argv[1]
+        if len(sys.argv) > 1
+        else os.getenv(
+            "MODE",
+            "brief",
+        )
+    ).lower()
+
+    commands = {
+        "brief": post_brief,
+        "reveal": reveal,
+        "selfcheck": selfcheck,
+    }
+
+    if mode not in commands:
+
+        raise SystemExit(
+            "Use: brief | reveal | selfcheck"
+        )
+
+    commands[mode]()
