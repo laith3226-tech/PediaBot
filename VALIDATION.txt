@@ -1,0 +1,15 @@
+VALIDATION
+Python syntax: OK
+GitHub Actions YAML: OK
+16-domain rotation: OK
+Persistent state: OK
+Question history cap: 2,000
+Article history cap: 2,000
+Duplicate/similarity rejection: enabled
+Same-day idempotency: enabled
+Brief/reveal exact persisted match: enabled
+Telegram regular polls (answers hidden): enabled
+HTTP retries/timeouts: enabled
+No finite repeating question bank: confirmed
+Failure policy: fail rather than recycle questions
+Secrets embedded: none
