@@ -1,83 +1,104 @@
-import os, html, random, requests, feedparser
+import os, html, requests, feedparser, hashlib, random
+from datetime import datetime, timezone
 
-TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "@LaythPeds")
+TOKEN=os.environ["TELEGRAM_BOT_TOKEN"]
+CHAT=os.getenv("TELEGRAM_CHAT_ID","@LaythPeds")
+API=f"https://api.telegram.org/bot{TOKEN}"
 
-FEEDS = [
-    ("WHO", "https://www.who.int/rss-feeds/news-english.xml"),
-    ("AAP Pediatrics", "https://publications.aap.org/rss/site_1000000/1000000.xml"),
+FEEDS=[
+ ("AAP Pediatrics","https://publications.aap.org/rss/site_1000000/1000000.xml"),
+ ("WHO","https://www.who.int/rss-feeds/news-english.xml"),
 ]
 
-MCQS = [
-    {
-        "q": "A child with anaphylaxis requires first-line treatment. What is the preferred medication and route?",
-        "options": ["IM epinephrine", "IV hydrocortisone", "Nebulized salbutamol", "IV antihistamine"],
-        "answer": "IM epinephrine",
-        "explanation": "IM epinephrine into the anterolateral thigh is first-line treatment for anaphylaxis."
-    },
-    {
-        "q": "Which presentation is most typical of viral croup?",
-        "options": ["Barking cough with inspiratory stridor", "Drooling with tripod position", "Focal crackles", "Isolated expiratory wheeze"],
-        "answer": "Barking cough with inspiratory stridor",
-        "explanation": "Croup classically causes a barking cough, hoarseness, and inspiratory stridor."
-    },
+QUESTIONS=[
+ {
+  "q":"A 4-year-old presents with barking cough, hoarseness and stridor at rest. What is the most appropriate initial pharmacologic treatment?",
+  "options":["Nebulized salbutamol only","Dexamethasone plus nebulized epinephrine","IV ceftriaxone","Nebulized hypertonic saline"],
+  "answer":1,
+  "explanation":"Stridor at rest indicates at least moderate croup. Give corticosteroid; nebulized epinephrine is indicated for moderate–severe symptoms.",
+  "pearl":"Observe after nebulized epinephrine because its clinical effect is transient."
+ },
+ {
+  "q":"An 8-year-old with asthma has symptoms 4 days/week and wakes with asthma twice/month. Which feature is most useful when selecting long-term therapy?",
+  "options":["Worst impairment/risk domain","Age alone","Presence of fever","Chest X-ray appearance"],
+  "answer":0,
+  "explanation":"Asthma control/severity assessment integrates impairment and future risk; treatment is based on the more severe relevant domain.",
+  "pearl":"Always assess technique, adherence, triggers and comorbidities before stepping up."
+ },
+ {
+  "q":"A child with anaphylaxis has wheeze, urticaria and hypotension. What is the first-line treatment?",
+  "options":["IM epinephrine","IV hydrocortisone","Nebulized salbutamol","Oral antihistamine"],
+  "answer":0,
+  "explanation":"IM epinephrine in the anterolateral thigh is first-line treatment; adjuncts must not delay it.",
+  "pearl":"Repeat IM epinephrine if clinically required while supporting airway, breathing and circulation."
+ },
+ {
+  "q":"A 2-month-old infant has poor feeding, diaphoresis and tachypnea with a new murmur. Which diagnosis should be prioritized?",
+  "options":["Heart failure from congenital heart disease","Simple viral rhinitis","Physiologic reflux","Teething"],
+  "answer":0,
+  "explanation":"Feeding intolerance, diaphoresis and tachypnea in early infancy are classic clues to heart failure, often as pulmonary vascular resistance falls.",
+  "pearl":"In infants, feeding is exercise—sweating and respiratory distress during feeds are important cardiac clues."
+ }
 ]
 
-def get_news():
-    items = []
-    for source, url in FEEDS:
+def tg(method,payload):
+    r=requests.post(f"{API}/{method}",json=payload,timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+def news():
+    out=[]; seen=set()
+    for source,url in FEEDS:
         try:
-            feed = feedparser.parse(url)
-            for entry in feed.entries[:3]:
-                title = entry.get("title", "").strip()
-                link = entry.get("link", "").strip()
-                if title and link:
-                    items.append((source, title, link))
-        except Exception as exc:
-            print(f"Feed error {source}: {exc}")
-    return items[:4]
+            f=feedparser.parse(url)
+            for e in f.entries[:8]:
+                title=e.get("title","").strip(); link=e.get("link","").strip()
+                key=title.lower()
+                if title and link and key not in seen:
+                    seen.add(key); out.append((source,title,link))
+        except Exception as e: print(source,e)
+    return out[:4]
 
-def build_message():
-    lines = [
-        "🩺 <b>Dr. Layth Pediatrics — Daily Brief</b>",
-        "",
-        "🌍 <b>Pediatric updates | تحديثات طب الأطفال</b>",
-    ]
-    news = get_news()
-    if news:
-        for source, title, link in news:
-            lines.append(
-                f'• <b>{html.escape(title)}</b>\n'
-                f'  {html.escape(source)} — <a href="{html.escape(link)}">Source</a>'
-            )
+def daily_questions():
+    day=datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    rnd=random.Random(int(hashlib.sha256(day.encode()).hexdigest()[:12],16))
+    return rnd.sample(QUESTIONS,2)
+
+def post_brief():
+    items=news()
+    lines=["🩺 <b>Dr. Layth Pediatrics | Daily Brief</b>",
+           "🌍 <b>Selected pediatric & child-health updates</b>",""]
+    if items:
+        for i,(source,title,link) in enumerate(items,1):
+            lines += [f"<b>{i}. {html.escape(title)}</b>",
+                      f"المصدر: {html.escape(source)} | <a href=\"{html.escape(link)}\">Read source</a>",""]
     else:
-        lines.append("• No feed items retrieved today. The bot will retry on the next run.")
+        lines += ["No reliable feed items were retrieved today.",""]
+    lines += ["🧠 <b>Board Challenge</b>",
+              "Two interactive questions are posted below. Vote now — answers and explanations will be revealed at 22:00 Qatar time.",
+              "","<i>Educational content only; not individualized medical advice.</i>"]
+    tg("sendMessage",{"chat_id":CHAT,"text":"\n".join(lines),"parse_mode":"HTML","disable_web_page_preview":True})
+    for idx,q in enumerate(daily_questions(),1):
+        tg("sendPoll",{
+            "chat_id":CHAT,
+            "question":f"Q{idx}. {q['q']}",
+            "options":q["options"],
+            "is_anonymous":True,
+            "type":"regular",
+            "allows_multiple_answers":False
+        })
 
-    q = random.choice(MCQS)
-    opts = "\n".join(f"{chr(65+i)}. {html.escape(x)}" for i, x in enumerate(q["options"]))
-    lines += [
-        "",
-        "🧠 <b>Clinical MCQ</b>",
-        html.escape(q["q"]),
-        opts,
-        "",
-        f"✅ <b>Answer:</b> {html.escape(q['answer'])}",
-        f"💡 {html.escape(q['explanation'])}",
-        "",
-        "<i>Educational content only; not individualized medical advice.</i>",
-    ]
-    return "\n".join(lines)
+def reveal():
+    lines=["✅ <b>Board Challenge — Answer Reveal</b>",""]
+    for idx,q in enumerate(daily_questions(),1):
+        ans=q["options"][q["answer"]]
+        lines += [f"<b>Q{idx}: {html.escape(ans)}</b>",
+                  f"📌 {html.escape(q['explanation'])}",
+                  f"💎 <b>Clinical pearl:</b> {html.escape(q['pearl'])}",""]
+    lines += ["See you tomorrow for the next challenge. 👨‍⚕️📚"]
+    tg("sendMessage",{"chat_id":CHAT,"text":"\n".join(lines),"parse_mode":"HTML","disable_web_page_preview":True})
 
-def send_message(text):
-    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    response = requests.post(url, json={
-        "chat_id": CHAT_ID,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-    }, timeout=30)
-    response.raise_for_status()
-    print("Telegram post sent successfully.")
-
-if __name__ == "__main__":
-    send_message(build_message())
+if __name__=="__main__":
+    mode=os.getenv("MODE","brief")
+    if mode=="reveal": reveal()
+    else: post_brief()
