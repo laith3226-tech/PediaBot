@@ -1,16 +1,28 @@
-name: Daily Pediatrics Telegram
+name: PediaBot Daily Channel
 
 on:
   workflow_dispatch:
+    inputs:
+      mode:
+        description: "What to publish"
+        required: true
+        default: "brief"
+        type: choice
+        options:
+          - brief
+          - reveal
+
   schedule:
-    - cron: "0 17 * * *"
+    - cron: "0 17 * * *" # 20:00 Qatar
+    - cron: "0 19 * * *" # 22:00 Qatar
 
 permissions:
   contents: read
 
 jobs:
-  post:
+  publish:
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
 
@@ -21,9 +33,21 @@ jobs:
 
       - run: pip install -r requirements.txt
 
+      - name: Choose mode
+        id: mode
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "value=${{ inputs.mode }}" >> "$GITHUB_OUTPUT"
+          elif [ "$(date -u +%H)" = "19" ]; then
+            echo "value=reveal" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=brief" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Publish to Telegram
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: "@LaythPeds"
+          MODE: ${{ steps.mode.outputs.value }}
         run: python pediabot.py
-        
